@@ -132,6 +132,9 @@ Plot the microphone positions from `array_geometry.yaml` to ensure:
 - The shape is physically reasonable  
 (In this dataset all x≈0, so the array lies in the YZ plane.)
 
+![Microphone array geometry (3D)](images/mic_array_3d.png)
+
+
 ### 3) Load data & basic cleanup
 - Load the 50-channel WAV as `(N, M)`
 - Remove DC per channel (subtract mean)
