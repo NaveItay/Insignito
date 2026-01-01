@@ -4,22 +4,21 @@
 
 ![Sound sources overlay (blank camera canvas)](outputs/sound_overlay.png)
 
-
 This repository contains a solution for the **Beamforming** task.
 
 We are given a **50-channel microphone array** recording that contains a mixture of **two acoustic sources** with known directions of arrival (DOA).  
-The goal is to design a beamformer that enhances each source while suppressing the other and additional noise.
+The goal is to design a beamformer that enhances each source while suppressing the other (and noise).
 
 ---
 
 ## Approach (Short)
 
-This solution uses **frequency-domain LCMV beamforming** (a constrained MVDR beamformer):
+This solution uses **frequency-domain LCMV beamforming** (MVDR with linear constraints):
 
-- **Output 1**: distortionless response to **Source #1**, and a **null** towards **Source #2**
-- **Output 2**: distortionless response to **Source #2**, and a **null** towards **Source #1**
+- **Output 1**: distortionless response to **Source #1** + **null** towards **Source #2**
+- **Output 2**: distortionless response to **Source #2** + **null** towards **Source #1**
 
-It also handles real-world issues by performing **basic microphone quality checks** (dead/noisy/clipped channels) and excluding problematic microphones before beamforming.
+To be robust on real recordings, it performs **basic microphone quality checks** (dead / noisy / clipped channels) and excludes problematic microphones before beamforming.
 
 ---
 
@@ -28,8 +27,12 @@ It also handles real-world issues by performing **basic microphone quality check
 ```
 Insignito/
   main.py
+  overlay_sources_on_image.py
   README.md
   outputs/
+    source1.wav
+    source2.wav
+    sound_overlay.png
   utils/
     recording.wav
     array_geometry.yaml
@@ -46,10 +49,10 @@ Insignito/
 
 Located under `utils/`:
 
-- `recording.wav` – Multichannel WAV (50 synchronized channels)
-- `array_geometry.yaml` – 3D positions of all microphones (`array_geometry`)
+- `recording.wav` – Multichannel WAV (**50 synchronized channels**)
+- `array_geometry.yaml` – Microphone positions (`array_geometry`) + camera parameters (for the bonus overlay)
 - Optional utilities:
-  - `recording_mono.wav` – A mono preview for listening
+  - `recording_mono.wav` – Mono preview for listening
   - `mono_converter.py` – Mono converter helper
   - `plot_geometry.py` – Microphone array geometry visualization
 
@@ -57,28 +60,43 @@ Located under `utils/`:
 
 ## Outputs
 
-The script generates (under `outputs/`):
+The main script generates (under `outputs/`):
 
-- `outputs/source1.wav`
-- `outputs/source2.wav`
+- `outputs/source1.wav` – Beamformed mono signal toward **DOA #1**
+- `outputs/source2.wav` – Beamformed mono signal toward **DOA #2**
 
-Each output is a **mono WAV** beamformed toward the corresponding DOA.
+Bonus script output:
+
+- `outputs/sound_overlay.png` – DOA projection on a blank camera canvas
 
 ---
 
 ## Requirements
 
+### Main beamforming script (`main.py`) – **NO SciPy**
 Python packages:
 
 - `numpy`
-- `scipy`
 - `soundfile`
 - `pyyaml`
 
 Install:
 
 ```powershell
-pip install numpy scipy soundfile pyyaml
+pip install numpy soundfile pyyaml
+```
+
+> Note: SciPy is intentionally not used to avoid NumPy/SciPy binary compatibility issues on some environments.
+
+### Bonus overlay script (`overlay_sources_on_image.py`)
+Additional packages:
+
+- `opencv-python`
+
+Install:
+
+```powershell
+pip install opencv-python
 ```
 
 ---
@@ -125,57 +143,84 @@ python ..\main.py --input_wav .\recording.wav --geometry_yaml .\array_geometry.y
 
 ---
 
-## Method – Step by Step (High Level)
+## Pipeline – Step by Step (Aligned to the Code Output)
 
-### 1) Sanity check: listen to a mono preview
-Many audio players cannot play 50-channel WAV files.  
-A quick check is to downmix to mono (e.g., mean over channels) and listen to confirm the recording contains the two sources.
+When you run the script, it prints numbered steps like:
 
-### 2) Verify microphone geometry visually
-Plot the microphone positions from `array_geometry.yaml` to ensure:
-- There are 50 microphones
-- Units look like meters
-- The shape is physically reasonable  
-(In this dataset all x≈0, so the array lies in the YZ plane.)
+- `[STEP 1] ...`
+- `[STEP 2] ...`
+- ...
+- `[STEP 11] ...`
 
-![Microphone array geometry (3D)](images/mic_array_3d.png)
+Below is what each step means and why it exists.
 
-### 3) Load data & basic cleanup
-- Load the 50-channel WAV as `(N, M)`
-- Remove DC per channel (subtract mean)
+### STEP 1) Load geometry YAML
+Reads `array_geometry.yaml` and loads **M microphone positions** (shape `(M,3)` in meters).  
+This geometry is required to compute **relative propagation delays** between microphones for a given direction-of-arrival (DOA).
 
-### 4) Detect and exclude bad microphones (real-world robustness)
-The code checks each channel for:
-- Very low RMS (dead mic)
-- Extremely high RMS (very noisy mic)
-- Excessive clipping  
-Bad channels are removed from both the audio matrix and geometry before beamforming.
+### STEP 2) Load multichannel WAV
+Loads `recording.wav` as an array of shape `(N, M)` and sample rate `fs`.  
+A small cleanup is applied: **DC removal per channel** (subtract mean), because offsets can leak into low-frequency bins and harm covariance estimates.
 
-### 5) Convert DOA (azimuth/elevation) to a 3D unit vector
-Using the assignment convention:
-- x = cos(-az) cos(-el)
-- y = sin(-az) cos(-el)
-- z = sin(-el)
+### STEP 3) Align audio channels with geometry (if mismatch)
+If the WAV has a different number of channels than the geometry file has microphones, the script uses the first `min(M_wav, M_geom)` channels/mics so both arrays match.
 
-### 6) Compute far-field delays and steering vectors
-Assuming a plane wave and speed of sound c:
-- delay per mic: tau[m] ∝ (p[m]·u)/c
-- steering vector per frequency: a[m](f) = exp(-j2πf tau[m])
+### STEP 4) Detect and exclude bad microphones (dead/noisy/clipped)
+Computes a quick health check per channel:
+- **dead**: RMS too low
+- **noisy**: RMS too high
+- **clipped**: too many samples near ±1.0
 
-### 7) STFT of all microphones
-Compute STFT per channel to work in the frequency domain:
-- X(f, t, m)
+Bad microphones are excluded from:
+- the audio matrix `x`
+- the geometry array `mic_pos`
 
-### 8) LCMV beamforming per frequency
+This improves stability and usually improves beamforming quality.
+
+### STEP 5) Choose STFT parameters (`n_fft` / `hop`)
+Chooses window size and hop:
+- `n_fft` controls **frequency resolution**
+- `hop` controls **time resolution** and overlap (typically hop = n_fft/4 → 75% overlap)
+
+You can override both from the command line.
+
+### STEP 6) Define DOAs (given by assignment)
+Defines the two known DOAs (azimuth/elevation in radians):
+- DOA1: az = -0.069, el = 0.0
+- DOA2: az =  1.029, el = 0.017
+
+These are converted to 3D unit direction vectors using the assignment convention.
+
+### STEP 7) Compute STFT for all microphones (**NO SciPy**)
+Computes STFT for each microphone channel using:
+- Hann window
+- overlap-add framing
+- FFT per frame
+
+Produces a tensor:
+- `X` with shape `(F, T, M)` (frequency bins × time frames × microphones)
+
+### STEP 8) Beamform source #1 (target=DOA1, null=DOA2)
 For each frequency bin:
-- Estimate spatial covariance R(f) from X
-- Build constraint matrix C = [a_target, a_interferer]
-- Solve LCMV weights so:
-  - w^H a_target = 1  (pass target)
-  - w^H a_interferer = 0 (null the other source)
+1. Estimate spatial covariance `R(f)` from the multichannel STFT.
+2. Build constraint matrix `C = [a_target, a_interferer]`
+   where `a(f)` are steering vectors.
+3. Solve **LCMV weights** `w(f)` such that:
+   - `wᴴ a_target = 1`  (pass target without distortion)
+   - `wᴴ a_interferer = 0` (null the other source)
 
-### 9) Inverse STFT and save outputs
-Apply weights to produce Y(f,t), inverse STFT to time domain, normalize, and write:
+Apply `w(f)` to obtain output STFT `Y1(f,t)`.
+
+### STEP 9) Beamform source #2 (target=DOA2, null=DOA1)
+Same as STEP 8, but swap target/interferer constraints to produce `Y2(f,t)`.
+
+### STEP 10) Inverse STFT to time domain (overlap-add)
+For each output STFT (`Y1` and `Y2`):
+- perform IFFT per frame
+- overlap-add frames back into a time-domain mono waveform
+
+### STEP 11) Normalize outputs and save WAV files
+Normalizes each output to a fixed peak (e.g., 0.99) and writes:
 - `outputs/source1.wav`
 - `outputs/source2.wav`
 
@@ -183,7 +228,7 @@ Apply weights to produce Y(f,t), inverse STFT to time domain, normalize, and wri
 
 ## Bonus – DOA overlay on camera canvas (no camera frame needed)
 
-This repository also includes a small bonus script that projects the **DOA directions** onto a **blank camera canvas** using the camera intrinsics/extrinsics in `array_geometry.yaml`.
+This repository includes a small bonus script that projects the **DOA directions** onto a **blank camera canvas** using the camera intrinsics/extrinsics in `array_geometry.yaml`.
 
 Run:
 
@@ -200,5 +245,5 @@ Result image:
 ## Notes
 
 - The solution assumes a **far-field plane-wave** model and uses the assignment-provided **azimuth/elevation → direction** conversion.
-- Since this is a real recording, some microphones may be degraded. The code detects and excludes obvious bad channels (**dead/noisy/clipped**).
-- A small **diagonal loading** term is used for numerical stability when inverting covariance matrices.
+- Real recordings often contain degraded channels; excluding **dead/noisy/clipped** mics improves robustness.
+- A small **diagonal loading** term is used when solving the beamformer weights for numerical stability.
