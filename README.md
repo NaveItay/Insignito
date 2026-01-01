@@ -2,11 +2,9 @@
 
 ![Microphone array geometry (3D)](images/mic_array_3d.png)
 
-![Sound sources overlay (blank camera canvas)](outputs/sound_overlay.png)
-
 This repository contains a complete solution for the **Beamforming** task.
 
-We are given a **50-channel microphone array** recording that contains a mixture of **two acoustic sources** with known directions of arrival (DOA).  
+We are given a **50-channel microphone array** recording that contains a mixture of **two acoustic sources** with known directions of arrival (DOA).
 The goal is to design a beamformer that enhances each source while suppressing the other (and background noise).
 
 ---
@@ -27,69 +25,67 @@ To be robust on real recordings, it performs **basic microphone quality checks**
 ```
 Insignito/
   main.py
-  overlay_sources_on_image.py
   requirements.txt
   README.md
-  outputs/
+  images/
+    mic_array_3d.png
+  INPUT/
+    recording.wav
+    array_geometry.yaml
+    (optional) recording_mono.wav
+  OUTPUT/
     source1.wav
     source2.wav
     sound_overlay.png
-  utils/
-    recording.wav
-    array_geometry.yaml
+  tools/
+    __init__.py
+    io_audio.py
+    mic_check.py
+    stft.py
+    steering.py
+    beamforming.py
+    audio_utils.py
+  scripts/
     mono_converter.py
     plot_geometry.py
-    recording_mono.wav
-  images/
-    mic_array_3d.png
+    overlay_sources_on_image.py
 ```
 
 ---
 
 ## Input Data
 
-Located under `utils/`:
+Located under `INPUT/`:
 
-- `recording.wav` – Multichannel WAV (**50 synchronized channels**)
-- `array_geometry.yaml` – Microphone positions (`array_geometry`) + camera parameters (for the bonus overlay)
-- Optional utilities:
-  - `recording_mono.wav` – Mono preview for listening
-  - `mono_converter.py` – Mono converter helper
-  - `plot_geometry.py` – Microphone array geometry visualization
+- `recording.wav` – multichannel WAV (**50 synchronized channels**)
+- `array_geometry.yaml` – microphone positions (`array_geometry`) and (if provided) camera parameters for the overlay script
 
 ---
 
 ## Outputs
 
-The main script generates (under `outputs/`):
+The main script generates (under `OUTPUT/`):
 
-- `outputs/source1.wav` – Beamformed mono signal toward **DOA #1**
-- `outputs/source2.wav` – Beamformed mono signal toward **DOA #2**
+- `OUTPUT/source1.wav` – beamformed mono signal toward **DOA #1**
+- `OUTPUT/source2.wav` – beamformed mono signal toward **DOA #2**
 
-Bonus script output:
+Optional script outputs:
 
-- `outputs/sound_overlay.png` – DOA projection on a blank camera canvas
+- `OUTPUT/sound_overlay.png` – DOA projection on a blank camera canvas
 
 ---
 
 ## Requirements
 
-### Main beamforming script (`main.py`) – NO SciPy
-This repo intentionally avoids SciPy to prevent NumPy/SciPy binary compatibility issues on some environments.
+This repo intentionally avoids **SciPy** and uses only NumPy-based STFT/ISTFT.
 
 Install dependencies from `requirements.txt`:
 
 ```powershell
-pip install -r requirements.txt
+pip install -r .\requirements.txt
 ```
 
-`requirements.txt` (main):
-- numpy
-- soundfile
-- pyyaml
-
-### Bonus overlay script (`overlay_sources_on_image.py`)
-If you want to run the bonus overlay script, also install:
+If you want to run the overlay script, you may also need:
 
 ```powershell
 pip install opencv-python
@@ -97,50 +93,40 @@ pip install opencv-python
 
 ---
 
-## How to Run
+## One-Command Runs (copy/paste)
 
-From the project root:
+> Run all commands from the **project root** (the folder containing `main.py`).
+
+### 1) Run the beamforming pipeline (`main.py`)
 
 ```powershell
-python .\main.py --input_wav .\utils\recording.wav --geometry_yaml .\utils\array_geometry.yaml --out_dir .\outputs
+python .\main.py --input_wav .\INPUT\recording.wav --geometry_yaml .\INPUT\array_geometry.yaml --out_dir .\OUTPUT --n_fft 2048 --hop 512 --c 343
 ```
 
-After running, you should have:
-
-- outputs\source1.wav
-- outputs\source2.wav
-
----
-
-## Optional Arguments
-
-### Control STFT parameters
+### 2) Create a mono preview (`scripts/mono_converter.py`)
 
 ```powershell
-python .\main.py --input_wav .\utils\recording.wav --geometry_yaml .\utils\array_geometry.yaml --out_dir .\outputs --n_fft 2048 --hop 512
+python .\scripts\mono_converter.py --input_wav .\INPUT\recording.wav --output_wav .\INPUT\recording_mono.wav
 ```
 
-### Change speed of sound
+### 3) Overlay DOAs on a blank camera canvas (`scripts/overlay_sources_on_image.py`)
 
 ```powershell
-python .\main.py --input_wav .\utils\recording.wav --geometry_yaml .\utils\array_geometry.yaml --out_dir .\outputs --c 343
+python .\scripts\overlay_sources_on_image.py --yaml .\INPUT\array_geometry.yaml --blank --invert_extrinsics --out .\OUTPUT\sound_overlay.png
 ```
 
----
-
-## Run from inside `utils/` (Alternative)
+### 4) Plot microphone array geometry (`scripts/plot_geometry.py`)
 
 ```powershell
-cd .\utils
-python ..\main.py --input_wav .\recording.wav --geometry_yaml .\array_geometry.yaml --out_dir ..\outputs
+python .\scripts\plot_geometry.py --yaml .\INPUT\array_geometry.yaml
 ```
 
 ---
 
-## Pipeline – Step by Step (Aligned to the Script Output)
+## Pipeline Details (Aligned to Script Output)
 
-When you run the script, it prints numbered steps like `[STEP 1] ...` through `[STEP 11] ...`.
-Below is what each step means and why it exists.
+When you run `main.py`, it prints numbered steps like `[STEP 1] ...` through `[STEP 11] ...`.
+Below is what each step does.
 
 ### STEP 1) Load geometry YAML
 Reads `array_geometry.yaml` and loads **M microphone positions** (shape `(M,3)` in meters).  
@@ -166,7 +152,7 @@ Chooses window size and hop:
 - `n_fft` controls **frequency resolution**: `Δf = fs / n_fft`
 - `hop` controls **time resolution** and overlap (default: hop = n_fft/4 → 75% overlap)
 
-### STEP 6) Define DOAs (given by assignment)
+### STEP 6) Define DOAs
 Defines the two known DOAs (azimuth/elevation in radians):
 - DOA1: az = -0.069, el = 0.0
 - DOA2: az =  1.029, el = 0.017
@@ -190,34 +176,13 @@ IFFT per frame + overlap-add reconstruction back to time domain, trimmed to the 
 
 ### STEP 11) Normalize outputs and save WAV files
 Normalize each output to a fixed peak (0.99) and write:
-- `outputs/source1.wav`
-- `outputs/source2.wav`
+- `OUTPUT/source1.wav`
+- `OUTPUT/source2.wav`
 
 ---
 
-## Bonus – DOA overlay on camera canvas (no camera frame needed)
+## Implementation Notes
 
-This repository includes a small bonus script that projects the **DOA directions** onto a **blank camera canvas** using the camera intrinsics/extrinsics in `array_geometry.yaml`.
-
-Run:
-
-```powershell
-python .\overlay_sources_on_image.py --yaml utils\array_geometry.yaml --blank --invert_extrinsics --out outputs\sound_overlay.png
-```
-
----
-
-## Notes
-
-- The solution assumes a **far-field plane-wave** model and uses the assignment-provided DOA convention.
-- Real recordings often contain degraded channels; excluding **dead/noisy/clipped** mics improves robustness.
-
----
-
-## 5) טיפ חשוב להגשה (Submission Tips)
-
-כדאי לציין (ואפשר להגיד בביטחון):
-
-- יש **regularization (diagonal loading)** על מטריצת הקו-וריאנס `R` כדי לשפר יציבות נומרית ולא להיתקע על מטריצה קרובה לסינגולרית.
-- יש **בדיקת sign** (בחירת סימן הדיליי) כדי לא להיתקע על **קונבנציית כיוונים** שגויה (צירי קואורדינטות / סימן דיליי).
-- יש **mic quality check** כדי להתמודד עם **data אמיתי** (ערוצים מתים/רועשים/קליפינג) לפני ה-beamforming.
+- Uses **diagonal loading (regularization)** of the covariance matrix to improve numerical stability in near-singular conditions.
+- Automatically chooses the **delay sign convention** by comparing delay-and-sum output energy for both sign options (helps avoid DOA convention mismatches).
+- Includes a **microphone quality check** (dead/noisy/clipped) to handle real-world recordings more robustly.
