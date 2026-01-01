@@ -1,4 +1,5 @@
 #!/usr/bin/env python3
+#!/usr/bin/env python3
 """
 Insignito Beamforming Assignment Solution
 ----------------------------------------
@@ -17,9 +18,27 @@ Outputs:
 
 Dependencies:
 - numpy
-- scipy
 - soundfile
 - pyyaml
+
+How to run
+----------
+1) Install dependencies:
+   pip install numpy soundfile pyyaml
+
+2) From the project root (recommended):
+   python .\\main.py --input_wav .\\utils\\recording.wav --geometry_yaml .\\utils\\array_geometry.yaml --out_dir .\\outputs
+
+3) Optional parameters:
+   - Choose STFT resolution:
+     python .\\main.py --input_wav .\\utils\\recording.wav --geometry_yaml .\\utils\\array_geometry.yaml --out_dir .\\outputs --n_fft 2048 --hop 512
+
+   - Change speed of sound:
+     python .\\main.py --input_wav .\\utils\\recording.wav --geometry_yaml .\\utils\\array_geometry.yaml --out_dir .\\outputs --c 343
+
+4) Outputs will be created under:
+   outputs\\source1.wav
+   outputs\\source2.wav
 """
 
 from __future__ import annotations
@@ -27,12 +46,11 @@ from __future__ import annotations
 import argparse
 import os
 from dataclasses import dataclass
-from typing import Tuple, List
+from typing import Tuple
 
 import numpy as np
 import soundfile as sf
 import yaml
-from scipy.signal import stft, istft
 
 
 # ------------------------- Configuration -------------------------
@@ -66,7 +84,7 @@ def load_geometry_yaml(path: str) -> np.ndarray:
 def load_multichannel_wav(path: str) -> Tuple[np.ndarray, int]:
     """
     Returns:
-      x: float64 array shape (N, M), scaled to [-1, 1] if original is int
+      x: float64 array shape (N, M)
       fs: sample rate
     """
     x, fs = sf.read(path, always_2d=True)
@@ -96,7 +114,6 @@ def doa_to_unit_vector(doa: DOA) -> np.ndarray:
         np.sin(-el),
     ], dtype=np.float64)
 
-    # Normalize (just in case)
     n = np.linalg.norm(u) + 1e-12
     return u / n
 
@@ -105,7 +122,7 @@ def compute_delays_seconds(mic_pos: np.ndarray, u: np.ndarray, c: float, sign: f
     """
     Far-field plane-wave relative delays:
         tau_m = sign * (p_m dot u) / c
-    We shift by tau[0] so mic0 is reference.
+    Shift by tau[0] so mic0 is reference.
     """
     tau = sign * (mic_pos @ u) / c
     tau = tau - tau[0]
@@ -117,8 +134,6 @@ def steering_vectors(freqs_hz: np.ndarray, delays_s: np.ndarray) -> np.ndarray:
     a(f)[m] = exp(-j*2*pi*f*delay[m])
     Returns shape (F, M)
     """
-    # freqs_hz: (F,)
-    # delays_s: (M,)
     phase = -2.0 * np.pi * freqs_hz[:, None] * delays_s[None, :]
     return np.exp(1j * phase)
 
@@ -138,21 +153,106 @@ def detect_bad_mics(x: np.ndarray, clip_threshold: float = 0.999) -> np.ndarray:
     rms = np.sqrt(np.mean(x**2, axis=0) + eps)
     med = np.median(rms)
 
-    # clipping ratio (works for float audio in [-1,1])
     clip_ratio = np.mean(np.abs(x) >= clip_threshold, axis=0)
 
-    # thresholds (tuned for robustness)
     dead = rms < (0.05 * med)
     noisy = rms > (20.0 * med)
-    clipped = clip_ratio > 1e-3  # 0.1% samples clipped is suspicious
-
+    clipped = clip_ratio > 1e-3
     bad = dead | noisy | clipped | ~np.isfinite(rms)
-    good = ~bad
 
-    return good
+    return ~bad
 
 
-# ------------------------- Beamforming Core -------------------------
+# ------------------------- STFT / ISTFT (NO SciPy) -------------------------
+
+def _stft_onesided(
+    x: np.ndarray,
+    fs: int,
+    n_fft: int,
+    hop: int,
+    window: np.ndarray,
+    center: bool = True
+) -> Tuple[np.ndarray, np.ndarray]:
+    """
+    Minimal STFT (onesided rFFT) for a 1D signal.
+    Returns:
+      Z: (F, T) complex
+      times: (T,) seconds (frame centers)
+    """
+    x = np.asarray(x, dtype=np.float64)
+    pad = n_fft // 2 if center else 0
+
+    if pad > 0:
+        x_pad = np.pad(x, (pad, pad), mode="constant")
+    else:
+        x_pad = x
+
+    # pad end so we have an integer number of frames
+    if len(x_pad) < n_fft:
+        x_pad = np.pad(x_pad, (0, n_fft - len(x_pad)), mode="constant")
+
+    n_frames = int(np.ceil((len(x_pad) - n_fft) / hop)) + 1
+    pad_end = (n_frames - 1) * hop + n_fft - len(x_pad)
+    if pad_end > 0:
+        x_pad = np.pad(x_pad, (0, pad_end), mode="constant")
+
+    F = n_fft // 2 + 1
+    Z = np.empty((F, n_frames), dtype=np.complex128)
+
+    for ti in range(n_frames):
+        start = ti * hop
+        frame = x_pad[start:start + n_fft]
+        frame = frame * window
+        Z[:, ti] = np.fft.rfft(frame, n=n_fft)
+
+    # frame center times (like common STFT “centered”)
+    if center:
+        times = ((np.arange(n_frames) * hop) - pad) / float(fs)
+    else:
+        times = (np.arange(n_frames) * hop) / float(fs)
+
+    return Z, times
+
+
+def _istft_onesided(
+    Z: np.ndarray,
+    fs: int,
+    n_fft: int,
+    hop: int,
+    window: np.ndarray,
+    length: int,
+    center: bool = True
+) -> np.ndarray:
+    """
+    Minimal inverse STFT (overlap-add) matching _stft_onesided.
+    Z shape: (F, T)
+    Returns y trimmed to 'length' samples (original length).
+    """
+    Z = np.asarray(Z, dtype=np.complex128)
+    n_frames = Z.shape[1]
+    pad = n_fft // 2 if center else 0
+
+    out_len = (n_frames - 1) * hop + n_fft
+    y = np.zeros(out_len, dtype=np.float64)
+    wsum = np.zeros(out_len, dtype=np.float64)
+
+    win_sq = window.astype(np.float64) ** 2
+
+    for ti in range(n_frames):
+        start = ti * hop
+        frame = np.fft.irfft(Z[:, ti], n=n_fft).astype(np.float64)
+        y[start:start + n_fft] += frame * window
+        wsum[start:start + n_fft] += win_sq
+
+    y = y / (wsum + 1e-12)
+
+    if center:
+        y = y[pad:pad + length]
+    else:
+        y = y[:length]
+
+    return y
+
 
 def stft_multichannel(
     x: np.ndarray,
@@ -161,32 +261,25 @@ def stft_multichannel(
     hop: int
 ) -> Tuple[np.ndarray, np.ndarray, np.ndarray]:
     """
-    Compute STFT for each channel.
+    Compute STFT for each channel (NO SciPy).
     Returns:
-      freqs, times, X where X has shape (F, T, M)
+      freqs: (F,)
+      times: (T,)
+      X: (F, T, M)
     """
-    nperseg = n_fft
-    noverlap = n_fft - hop
+    window = np.hanning(n_fft).astype(np.float64)
 
     X_list = []
-    freqs = times = None
+    times = None
 
     for m in range(x.shape[1]):
-        f, t, Z = stft(
-            x[:, m],
-            fs=fs,
-            window="hann",
-            nperseg=nperseg,
-            noverlap=noverlap,
-            boundary="zeros",
-            padded=True,
-            return_onesided=True
-        )
-        if freqs is None:
-            freqs, times = f, t
-        X_list.append(Z)  # (F, T)
+        Z, t = _stft_onesided(x[:, m], fs, n_fft, hop, window, center=True)
+        if times is None:
+            times = t
+        X_list.append(Z)  # (F,T)
 
-    X = np.stack(X_list, axis=-1)  # (F, T, M)
+    X = np.stack(X_list, axis=-1)  # (F,T,M)
+    freqs = np.fft.rfftfreq(n_fft, d=1.0 / fs)
     return freqs, times, X
 
 
@@ -194,22 +287,15 @@ def istft_mono(
     Y: np.ndarray,
     fs: int,
     n_fft: int,
-    hop: int
+    hop: int,
+    length: int
 ) -> np.ndarray:
     """Inverse STFT for mono signal. Y shape: (F, T)."""
-    nperseg = n_fft
-    noverlap = n_fft - hop
-    _, y = istft(
-        Y,
-        fs=fs,
-        window="hann",
-        nperseg=nperseg,
-        noverlap=noverlap,
-        input_onesided=True,
-        boundary=True
-    )
-    return np.asarray(y, dtype=np.float64)
+    window = np.hanning(n_fft).astype(np.float64)
+    return _istft_onesided(Y, fs, n_fft, hop, window, length=length, center=True)
 
+
+# ------------------------- Beamforming Core -------------------------
 
 def choose_delay_sign_by_ds_energy(
     X: np.ndarray,
@@ -219,9 +305,8 @@ def choose_delay_sign_by_ds_energy(
     c: float
 ) -> float:
     """
-    The DOA sign convention can flip depending on coordinate definition.
-    We test both signs using a simple delay-and-sum score and pick the one
-    that yields higher output power.
+    DOA sign convention can flip depending on coordinate definition.
+    We test both signs using a delay-and-sum score and pick the one with higher output power.
     """
     u = doa_to_unit_vector(doa)
 
@@ -229,13 +314,10 @@ def choose_delay_sign_by_ds_energy(
         tau = compute_delays_seconds(mic_pos, u, c, sign)
         a = steering_vectors(freqs, tau)  # (F,M)
         M = a.shape[1]
-        # DS weights (distortionless): w ~ a / M
-        # y(f,t) = x(f,t,:) @ conj(w)
-        # compute quick power score
         power = 0.0
         for fi in range(X.shape[0]):
-            w = a[fi, :] / M  # (M,)
-            y = X[fi, :, :] @ np.conj(w)  # (T,)
+            w = a[fi, :] / M
+            y = X[fi, :, :] @ np.conj(w)
             power += float(np.mean(np.abs(y) ** 2))
         return power
 
@@ -255,34 +337,26 @@ def lcmv_weights_per_freq(
 
     Closed form:
       w = R^{-1} C (C^H R^{-1} C)^{-1} f_vec
-
-    R: (M,M)
-    C: (M,K)
-    f_vec: (K,)
-    Returns: w (M,)
     """
     M = R.shape[0]
-    K = C.shape[1]
 
-    # regularization for numerical stability
     trace = np.trace(R).real
     dl = 1e-3 * (trace / M + 1e-12)
     R_reg = R + dl * np.eye(M, dtype=R.dtype)
 
-    # Solve R^{-1} C without explicitly inverting R
     try:
-        RinvC = np.linalg.solve(R_reg, C)  # (M,K)
+        RinvC = np.linalg.solve(R_reg, C)
     except np.linalg.LinAlgError:
         RinvC = np.linalg.pinv(R_reg) @ C
 
-    G = C.conj().T @ RinvC  # (K,K)
+    G = C.conj().T @ RinvC
 
     try:
         Ginv = np.linalg.inv(G)
     except np.linalg.LinAlgError:
         Ginv = np.linalg.pinv(G)
 
-    w = RinvC @ (Ginv @ f_vec)  # (M,)
+    w = RinvC @ (Ginv @ f_vec)
     return w
 
 
@@ -298,11 +372,9 @@ def beamform_lcmv(
     LCMV beamforming per-frequency:
       - pass target with gain 1
       - null interferer with gain 0
-
     Returns:
       Y: (F,T) complex STFT for the target output
     """
-    # Decide sign convention automatically using DS energy for the target DOA
     sign = choose_delay_sign_by_ds_energy(X, freqs, mic_pos, doa_target, c)
 
     u_t = doa_to_unit_vector(doa_target)
@@ -320,13 +392,12 @@ def beamform_lcmv(
     f_vec = np.array([1.0 + 0j, 0.0 + 0j], dtype=np.complex128)
 
     for fi in range(F):
-        Xf = X[fi, :, :]              # (T,M)
+        Xf = X[fi, :, :]                    # (T,M)
         R = (Xf.conj().T @ Xf) / max(T, 1)  # (M,M)
 
         C = np.stack([a_t[fi, :], a_i[fi, :]], axis=1)  # (M,2)
         w = lcmv_weights_per_freq(R, C, f_vec)          # (M,)
 
-        # Apply: y(t) = w^H x(t) = x(t,:) @ conj(w)
         Y[fi, :] = Xf @ np.conj(w)
 
     return Y
@@ -343,46 +414,47 @@ def normalize_audio(y: np.ndarray, peak: float = 0.99) -> np.ndarray:
 # ------------------------- Main -------------------------
 
 def main() -> None:
-    parser = argparse.ArgumentParser(description="50ch Beamforming (LCMV) - Insignito Assignment")
+    parser = argparse.ArgumentParser(description="50ch Beamforming (LCMV) - Insignito Assignment (NO SciPy)")
     parser.add_argument("--input_wav", default="recording.wav", help="Path to multichannel wav (50ch)")
     parser.add_argument("--geometry_yaml", default="array_geometry.yaml", help="Path to geometry YAML")
     parser.add_argument("--out_dir", default="outputs", help="Output directory")
     parser.add_argument("--c", type=float, default=SPEED_OF_SOUND, help="Speed of sound (m/s)")
-
-    # STFT settings
     parser.add_argument("--n_fft", type=int, default=0, help="FFT size (0=auto)")
     parser.add_argument("--hop", type=int, default=0, help="Hop size (0=auto)")
-
     args = parser.parse_args()
 
     os.makedirs(args.out_dir, exist_ok=True)
 
-    # Load data
+    print("\n[STEP 1] Load geometry YAML...")
     mic_pos = load_geometry_yaml(args.geometry_yaml)
-    x, fs = load_multichannel_wav(args.input_wav)
+    print(f"        Geometry loaded: {mic_pos.shape[0]} mics")
 
+    print("[STEP 2] Load multichannel WAV...")
+    x, fs = load_multichannel_wav(args.input_wav)
+    N, M_audio = x.shape
+    print(f"        Audio loaded: N={N} samples, M={M_audio} channels, fs={fs} Hz")
+
+    print("[STEP 3] Align audio channels with geometry (if mismatch)...")
     if x.shape[1] != mic_pos.shape[0]:
         M = min(x.shape[1], mic_pos.shape[0])
-        print(f"[WARN] Channel count mismatch: WAV has {x.shape[1]}ch, geometry has {mic_pos.shape[0]} mics.")
-        print(f"[WARN] Using first {M} channels/mics.")
+        print(f"        [WARN] Mismatch: WAV has {x.shape[1]}ch, geometry has {mic_pos.shape[0]} mics.")
+        print(f"        [WARN] Using first {M} channels/mics.")
         x = x[:, :M]
         mic_pos = mic_pos[:M, :]
+    print(f"        Using M={x.shape[1]} channels/mics")
 
-    print(f"[INFO] Loaded audio: {x.shape[0]} samples, {x.shape[1]} channels, fs={fs} Hz")
-    print(f"[INFO] Geometry: {mic_pos.shape[0]} mics")
-
-    # Detect bad microphones
+    print("[STEP 4] Detect and exclude bad microphones (dead/noisy/clipped)...")
     good_mask = detect_bad_mics(x)
-    good_idx = np.where(good_mask)[0].tolist()
-    bad_idx = np.where(~good_mask)[0].tolist()
-    print(f"[INFO] Good mics: {len(good_idx)} / {x.shape[1]}")
+    good_idx = np.flatnonzero(good_mask).tolist()
+    bad_idx = np.flatnonzero(~good_mask).tolist()
+    print(f"        Good mics: {len(good_idx)} / {x.shape[1]}")
     if bad_idx:
-        print(f"[INFO] Excluding bad mics: {bad_idx}")
+        print(f"        Excluding bad mics: {bad_idx}")
 
     x = x[:, good_mask]
     mic_pos = mic_pos[good_mask, :]
 
-    # Auto STFT params
+    print("[STEP 5] Choose STFT parameters (n_fft / hop)...")
     if args.n_fft > 0:
         n_fft = args.n_fft
     else:
@@ -393,28 +465,29 @@ def main() -> None:
     else:
         hop = n_fft // 4  # 75% overlap
 
-    print(f"[INFO] STFT: n_fft={n_fft}, hop={hop}")
+    print(f"        STFT params: n_fft={n_fft}, hop={hop}")
 
-    # DOAs from assignment
+    print("[STEP 6] Define DOAs (given by assignment)...")
     doa1 = DOA(azimuth=-0.069, elevation=0.0)
     doa2 = DOA(azimuth=1.029, elevation=0.017)
+    print(f"        DOA1: az={doa1.azimuth} rad, el={doa1.elevation} rad")
+    print(f"        DOA2: az={doa2.azimuth} rad, el={doa2.elevation} rad")
 
-    # STFT
+    print("[STEP 7] Compute STFT for all microphones (NO SciPy)...")
     freqs, times, X = stft_multichannel(x, fs, n_fft, hop)
-    print(f"[INFO] STFT shapes: freqs={freqs.shape}, times={times.shape}, X={X.shape}")
+    print(f"        STFT shapes: freqs={freqs.shape}, times={times.shape}, X={X.shape} (F,T,M)")
 
-    # Beamforming
-    print("[INFO] Beamforming source #1 (target=doa1, null=doa2)...")
+    print("[STEP 8] Beamform source #1 (target=DOA1, null=DOA2)...")
     Y1 = beamform_lcmv(X, freqs, mic_pos, doa_target=doa1, doa_interf=doa2, c=args.c)
 
-    print("[INFO] Beamforming source #2 (target=doa2, null=doa1)...")
+    print("[STEP 9] Beamform source #2 (target=DOA2, null=DOA1)...")
     Y2 = beamform_lcmv(X, freqs, mic_pos, doa_target=doa2, doa_interf=doa1, c=args.c)
 
-    # iSTFT
-    y1 = istft_mono(Y1, fs, n_fft, hop)
-    y2 = istft_mono(Y2, fs, n_fft, hop)
+    print("[STEP 10] Inverse STFT to time domain (overlap-add)...")
+    y1 = istft_mono(Y1, fs, n_fft, hop, length=N)
+    y2 = istft_mono(Y2, fs, n_fft, hop, length=N)
 
-    # Normalize & save
+    print("[STEP 11] Normalize outputs and save WAV files...")
     y1 = normalize_audio(y1)
     y2 = normalize_audio(y2)
 
@@ -424,7 +497,7 @@ def main() -> None:
     sf.write(out2, y2.astype(np.float32), fs)
 
     print(f"[DONE] Wrote: {out1}")
-    print(f"[DONE] Wrote: {out2}")
+    print(f"[DONE] Wrote: {out2}\n")
 
 
 if __name__ == "__main__":
