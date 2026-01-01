@@ -1,0 +1,12 @@
+# python
+__pycache__/
+*.pyc
+.venv/
+.env/
+
+# ide
+.idea/
+.vscode/
+
+# documents
+*.pdf
