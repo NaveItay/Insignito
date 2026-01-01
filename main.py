@@ -1,8 +1,7 @@
 #!/usr/bin/env python3
-#!/usr/bin/env python3
 """
-Insignito Beamforming Assignment Solution
-----------------------------------------
+Insignito Beamforming Assignment Solution (NO SciPy)
+----------------------------------------------------
 Beamformer: Frequency-domain LCMV (MVDR with linear constraints)
 - Output 1: Distortionless response to source #1, null to source #2
 - Output 2: Distortionless response to source #2, null to source #1
@@ -51,7 +50,6 @@ from typing import Tuple
 import numpy as np
 import soundfile as sf
 import yaml
-
 
 # ------------------------- Configuration -------------------------
 
@@ -140,27 +138,79 @@ def steering_vectors(freqs_hz: np.ndarray, delays_s: np.ndarray) -> np.ndarray:
 
 # ------------------------- Mic Health / Selection -------------------------
 
-def detect_bad_mics(x: np.ndarray, clip_threshold: float = 0.999) -> np.ndarray:
+def detect_bad_mics(
+    x: np.ndarray,
+    clip_threshold: float = 0.999,
+    print_report: bool = True,
+    print_all: bool = False,
+) -> np.ndarray:
     """
-    Simple robust mic selection:
-      - remove channels with extremely low RMS (dead)
-      - remove channels with extremely high RMS (very noisy)
-      - remove channels with frequent clipping (|x| near 1 for float audio)
+    Simple robust mic selection + report.
+
+    Rules:
+      - dead:    rms < 0.05 * median_rms
+      - noisy:   rms > 20.0 * median_rms
+      - clipped: clip_ratio > 1e-3   (more than 0.1% samples saturated)
+
     Returns:
       good_mask: boolean shape (M,)
     """
     eps = 1e-12
-    rms = np.sqrt(np.mean(x**2, axis=0) + eps)
-    med = np.median(rms)
 
-    clip_ratio = np.mean(np.abs(x) >= clip_threshold, axis=0)
+    rms = np.sqrt(np.mean(x ** 2, axis=0) + eps)          # (M,)
+    med = float(np.median(rms))
+
+    clip_ratio = np.mean(np.abs(x) >= clip_threshold, axis=0)  # (M,)
 
     dead = rms < (0.05 * med)
     noisy = rms > (20.0 * med)
     clipped = clip_ratio > 1e-3
-    bad = dead | noisy | clipped | ~np.isfinite(rms)
+    not_finite = ~np.isfinite(rms)
 
-    return ~bad
+    bad = dead | noisy | clipped | not_finite
+    good = ~bad
+
+    if print_report:
+        M = x.shape[1]
+        print("[MIC CHECK] thresholds:")
+        print(f"  median_rms = {med:.6e}")
+        print(f"  dead   if rms < {(0.05 * med):.6e}  (0.05 * median)")
+        print(f"  noisy  if rms > {(20.0 * med):.6e}  (20 * median)")
+        print(f"  clipped if clip_ratio > 1.0e-3  (0.1%) with |x| >= {clip_threshold}")
+        print("")
+
+        idxs = list(range(M)) if print_all else np.flatnonzero(bad).tolist()
+
+        if len(idxs) == 0:
+            print("[MIC CHECK] No bad microphones detected.")
+        else:
+            print("[MIC CHECK] Report:")
+            for i in idxs:
+                reasons = []
+                if dead[i]:
+                    reasons.append("dead (low RMS)")
+                if noisy[i]:
+                    reasons.append("noisy (high RMS)")
+                if clipped[i]:
+                    reasons.append("clipped")
+                if not_finite[i]:
+                    reasons.append("non-finite RMS")
+
+                ratio = float(rms[i] / (med + eps))
+                status = "BAD" if bad[i] else "OK "
+                reason_str = ", ".join(reasons) if reasons else "—"
+
+                print(
+                    f"  ch {i:02d} | {status} | rms={rms[i]:.6e} (x{ratio:.2f} of med) "
+                    f"| clip_ratio={clip_ratio[i]:.6e} | {reason_str}"
+                )
+
+        print("")
+        bad_list = np.flatnonzero(bad).tolist()
+        print(f"[MIC CHECK] bad mics: {bad_list}")
+        print(f"[MIC CHECK] good mics: {int(np.sum(good))} / {M}")
+
+    return good
 
 
 # ------------------------- STFT / ISTFT (NO SciPy) -------------------------
@@ -182,12 +232,8 @@ def _stft_onesided(
     x = np.asarray(x, dtype=np.float64)
     pad = n_fft // 2 if center else 0
 
-    if pad > 0:
-        x_pad = np.pad(x, (pad, pad), mode="constant")
-    else:
-        x_pad = x
+    x_pad = np.pad(x, (pad, pad), mode="constant") if pad > 0 else x
 
-    # pad end so we have an integer number of frames
     if len(x_pad) < n_fft:
         x_pad = np.pad(x_pad, (0, n_fft - len(x_pad)), mode="constant")
 
@@ -201,11 +247,10 @@ def _stft_onesided(
 
     for ti in range(n_frames):
         start = ti * hop
-        frame = x_pad[start:start + n_fft]
-        frame = frame * window
+        frame = x_pad[start:start + n_fft] * window
         Z[:, ti] = np.fft.rfft(frame, n=n_fft)
 
-    # frame center times (like common STFT “centered”)
+    # times are not essential for processing; used for debug/shape printouts
     if center:
         times = ((np.arange(n_frames) * hop) - pad) / float(fs)
     else:
@@ -276,7 +321,7 @@ def stft_multichannel(
         Z, t = _stft_onesided(x[:, m], fs, n_fft, hop, window, center=True)
         if times is None:
             times = t
-        X_list.append(Z)  # (F,T)
+        X_list.append(Z)
 
     X = np.stack(X_list, axis=-1)  # (F,T,M)
     freqs = np.fft.rfftfreq(n_fft, d=1.0 / fs)
@@ -339,7 +384,6 @@ def lcmv_weights_per_freq(
       w = R^{-1} C (C^H R^{-1} C)^{-1} f_vec
     """
     M = R.shape[0]
-
     trace = np.trace(R).real
     dl = 1e-3 * (trace / M + 1e-12)
     R_reg = R + dl * np.eye(M, dtype=R.dtype)
@@ -361,21 +405,25 @@ def lcmv_weights_per_freq(
 
 
 def beamform_lcmv(
-    X: np.ndarray,          # (F,T,M)
-    freqs: np.ndarray,      # (F,)
-    mic_pos: np.ndarray,    # (M,3)
+    X: np.ndarray,         # (F,T,M)
+    freqs: np.ndarray,     # (F,)
+    mic_pos: np.ndarray,   # (M,3)
     doa_target: DOA,
     doa_interf: DOA,
-    c: float
+    c: float,
+    verbose: bool = False
 ) -> np.ndarray:
     """
     LCMV beamforming per-frequency:
       - pass target with gain 1
       - null interferer with gain 0
+
     Returns:
       Y: (F,T) complex STFT for the target output
     """
     sign = choose_delay_sign_by_ds_energy(X, freqs, mic_pos, doa_target, c)
+    if verbose:
+        print(f"        [INFO] Using delay sign = {sign:+.0f} for target DOA")
 
     u_t = doa_to_unit_vector(doa_target)
     u_i = doa_to_unit_vector(doa_interf)
@@ -392,8 +440,8 @@ def beamform_lcmv(
     f_vec = np.array([1.0 + 0j, 0.0 + 0j], dtype=np.complex128)
 
     for fi in range(F):
-        Xf = X[fi, :, :]                    # (T,M)
-        R = (Xf.conj().T @ Xf) / max(T, 1)  # (M,M)
+        Xf = X[fi, :, :]  # (T,M)
+        R = (Xf.conj().T @ Xf) / max(T, 1)
 
         C = np.stack([a_t[fi, :], a_i[fi, :]], axis=1)  # (M,2)
         w = lcmv_weights_per_freq(R, C, f_vec)          # (M,)
@@ -444,7 +492,7 @@ def main() -> None:
     print(f"        Using M={x.shape[1]} channels/mics")
 
     print("[STEP 4] Detect and exclude bad microphones (dead/noisy/clipped)...")
-    good_mask = detect_bad_mics(x)
+    good_mask = detect_bad_mics(x, print_report=True, print_all=False)
     good_idx = np.flatnonzero(good_mask).tolist()
     bad_idx = np.flatnonzero(~good_mask).tolist()
     print(f"        Good mics: {len(good_idx)} / {x.shape[1]}")
@@ -455,16 +503,8 @@ def main() -> None:
     mic_pos = mic_pos[good_mask, :]
 
     print("[STEP 5] Choose STFT parameters (n_fft / hop)...")
-    if args.n_fft > 0:
-        n_fft = args.n_fft
-    else:
-        n_fft = 2048 if fs >= 32000 else 1024
-
-    if args.hop > 0:
-        hop = args.hop
-    else:
-        hop = n_fft // 4  # 75% overlap
-
+    n_fft = args.n_fft if args.n_fft > 0 else (2048 if fs >= 32000 else 1024)
+    hop = args.hop if args.hop > 0 else (n_fft // 4)  # 75% overlap
     print(f"        STFT params: n_fft={n_fft}, hop={hop}")
 
     print("[STEP 6] Define DOAs (given by assignment)...")
@@ -478,10 +518,10 @@ def main() -> None:
     print(f"        STFT shapes: freqs={freqs.shape}, times={times.shape}, X={X.shape} (F,T,M)")
 
     print("[STEP 8] Beamform source #1 (target=DOA1, null=DOA2)...")
-    Y1 = beamform_lcmv(X, freqs, mic_pos, doa_target=doa1, doa_interf=doa2, c=args.c)
+    Y1 = beamform_lcmv(X, freqs, mic_pos, doa_target=doa1, doa_interf=doa2, c=args.c, verbose=True)
 
     print("[STEP 9] Beamform source #2 (target=DOA2, null=DOA1)...")
-    Y2 = beamform_lcmv(X, freqs, mic_pos, doa_target=doa2, doa_interf=doa1, c=args.c)
+    Y2 = beamform_lcmv(X, freqs, mic_pos, doa_target=doa2, doa_interf=doa1, c=args.c, verbose=True)
 
     print("[STEP 10] Inverse STFT to time domain (overlap-add)...")
     y1 = istft_mono(Y1, fs, n_fft, hop, length=N)
