@@ -2,6 +2,8 @@
 
 ![Microphone array geometry (3D)](images/mic_array_3d.png)
 
+![Sound sources overlay (blank camera canvas)](OUTPUT/sound_overlay.png)
+
 This repository contains a complete solution for the **Beamforming** task.
 
 We are given a **50‑channel microphone array** recording that contains a mixture of **two acoustic sources** with known directions of arrival (DOA).
