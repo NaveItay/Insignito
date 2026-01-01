@@ -31,6 +31,8 @@ Insignito/
     mono_converter.py
     plot_geometry.py
     recording_mono.wav
+  images/
+    mic_array_3d.png
 ```
 
 ---
@@ -81,7 +83,6 @@ pip install numpy scipy soundfile pyyaml
 From the project root:
 
 ```powershell
-cd C:\Users\itay\Desktop\python_projects\SMP_DETECTOR\Insignito
 python .\main.py --input_wav .\utils\recording.wav --geometry_yaml .\utils\array_geometry.yaml --out_dir .\outputs
 ```
 
@@ -134,7 +135,6 @@ Plot the microphone positions from `array_geometry.yaml` to ensure:
 
 ![Microphone array geometry (3D)](images/mic_array_3d.png)
 
-
 ### 3) Load data & basic cleanup
 - Load the 50-channel WAV as `(N, M)`
 - Remove DC per channel (subtract mean)
@@ -176,10 +176,24 @@ Apply weights to produce Y(f,t), inverse STFT to time domain, normalize, and wri
 
 ---
 
+## Bonus – DOA overlay on camera canvas (no camera frame needed)
+
+This repository also includes a small bonus script that projects the **DOA directions** onto a **blank camera canvas** using the camera intrinsics/extrinsics in `array_geometry.yaml`.
+
+Run:
+
+```powershell
+python .\overlay_sources_on_image.py --yaml utils\array_geometry.yaml --blank --invert_extrinsics --out outputs\sound_overlay.png
+```
+
+Result image:
+
+![Sound sources overlay (blank camera canvas)](outputs/sound_overlay.png)
+
+---
+
 ## Notes
 
 - The solution assumes a **far-field plane-wave** model and uses the assignment-provided **azimuth/elevation → direction** conversion.
 - Since this is a real recording, some microphones may be degraded. The code detects and excludes obvious bad channels (**dead/noisy/clipped**).
 - A small **diagonal loading** term is used for numerical stability when inverting covariance matrices.
-
----
