@@ -1,5 +1,10 @@
 # Insignito – Beamforming Assignment
 
+![Microphone array geometry (3D)](images/mic_array_3d.png)
+
+![Sound sources overlay (blank camera canvas)](outputs/sound_overlay.png)
+
+
 This repository contains a solution for the **Beamforming** task.
 
 We are given a **50-channel microphone array** recording that contains a mixture of **two acoustic sources** with known directions of arrival (DOA).  
